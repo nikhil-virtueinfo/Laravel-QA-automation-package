@@ -1,0 +1,33 @@
+{
+    "name": "deep-qa/laravel-system-test-framework",
+    "description": "Autonomous Laravel System-Test and Deep UI Contract QA Framework",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Nikhil & Deep QA Team",
+            "email": "dev@deep-qa.org"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/support": "^10.0|^11.0|^12.0",
+        "illuminate/console": "^10.0|^11.0|^12.0"
+    },
+    "require-dev": {
+        "laravel/dusk": "^8.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "SystemTestFramework\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "SystemTestFramework\\SystemTestServiceProvider"
+            ]
+        }
+    }
+}
+

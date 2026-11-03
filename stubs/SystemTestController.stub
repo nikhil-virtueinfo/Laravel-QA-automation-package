@@ -1,0 +1,351 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\SystemTest\Storage\RunRepository;
+use App\SystemTest\SystemTestRunner;
+use App\SystemTest\World\SyntheticWorld;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Symfony\Component\Process\Process;
+
+class SystemTestController extends AdminController
+{
+    protected RunRepository $repository;
+
+    public function __construct()
+    {
+        parent::__construct();
+
+        // System Tests are strictly disabled on staging and production
+        if (!app()->environment('local')) {
+            abort(404);
+        }
+
+        $this->repository = new RunRepository();
+    }
+
+    /**
+     * Display System Tests Dashboard & Run History.
+     */
+    public function index()
+    {
+        $runs = $this->repository->listRuns(30);
+        $latest = $runs[0] ?? null;
+
+        // Auto-discover existing ticket test suites in tests/Browser/
+        $ticketSuites = [];
+        $testFiles = glob(base_path('tests/Browser/*Test.php')) ?: [];
+        foreach ($testFiles as $file) {
+            $base = basename($file);
+            if (preg_match('/^([A-Z]+)(\d+)Test\.php$/i', $base, $m)) {
+                $ticketKey = strtoupper($m[1]) . '-' . $m[2];
+                $ticketSuites[] = [
+                    'key' => $ticketKey,
+                    'file' => $base,
+                    'mtime' => filemtime($file),
+                ];
+            }
+        }
+
+        // Summary stats across recorded runs
+        $totalRunsCount = count($runs);
+        $passedRunsCount = count(array_filter($runs, fn($r) => ($r['status'] ?? '') === 'passed'));
+        $overallPassRate = $totalRunsCount > 0 ? round(($passedRunsCount / $totalRunsCount) * 100, 1) : 0;
+
+        return view('admin.system_tests.index', [
+            'layout' => $this->resolveDashboardLayout(),
+            'runs' => $runs,
+            'latest' => $latest,
+            'ticketSuites' => $ticketSuites,
+            'totalRunsCount' => $totalRunsCount,
+            'passedRunsCount' => $passedRunsCount,
+            'overallPassRate' => $overallPassRate,
+        ]);
+    }
+
+    /**
+     * Trigger background execution of System Test suite.
+     */
+    public function run(Request $request): JsonResponse
+    {
+        $noBrowser = $request->boolean('no_browser', false);
+        $headed = $request->boolean('headed', false);
+
+        // 1. Pre-create run manifest so the exact runId is returned immediately
+        $trigger = $headed ? 'web (headed)' : ($noBrowser ? 'web (quick)' : 'web');
+        $run = $this->repository->createRun($trigger);
+        $runId = $run['id'];
+
+        // 2. Decouple execution via nohup so process lives past HTTP request termination
+        $php = PHP_BINARY ?: '/usr/bin/php';
+        $artisan = base_path('artisan');
+        $logPath = storage_path('logs/system-test-web.log');
+
+        $flagParts = ["--run-id={$runId}"];
+        if ($noBrowser) {
+            $flagParts[] = '--no-browser';
+        } elseif ($headed) {
+            $flagParts[] = '--headed';
+        }
+        $flags = implode(' ', $flagParts);
+
+        // Auto-detect Display and XAuthority for visible browser mode
+        $display = getenv('DISPLAY') ?: ($_SERVER['DISPLAY'] ?? ':1');
+        if (file_exists('/tmp/.X11-unix/X0') && $display === ':1') {
+            $display = ':0';
+        }
+
+        $uid = getmyuid();
+        $authPaths = [
+            getenv('XAUTHORITY') ?: ($_SERVER['XAUTHORITY'] ?? ''),
+            getenv('HOME') . '/.Xauthority',
+            "/run/user/{$uid}/gdm/Xauthority",
+        ];
+        $xauth = '';
+        foreach ($authPaths as $path) {
+            if ($path && file_exists($path)) {
+                $xauth = $path;
+                break;
+            }
+        }
+
+        $envPrefix = "DISPLAY=" . escapeshellarg($display);
+        if ($xauth) {
+            $envPrefix .= " XAUTHORITY=" . escapeshellarg($xauth);
+        }
+
+        $cmd = sprintf(
+            '%s nohup %s %s system-test:run %s >> %s 2>&1 &',
+            $envPrefix,
+            escapeshellarg($php),
+            escapeshellarg($artisan),
+            $flags,
+            escapeshellarg($logPath)
+        );
+
+        exec($cmd);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'System Test execution started in background.',
+            'run_id' => $runId,
+            'status_url' => route('admin.system-tests.status', $runId),
+        ]);
+    }
+
+    /**
+     * Poll live status of an ongoing or completed run.
+     */
+    public function status(string $runId): JsonResponse
+    {
+        $run = $this->repository->getRun($runId);
+        if (!$run) {
+            return response()->json(['error' => 'Run not found'], 404);
+        }
+
+        return response()->json($run);
+    }
+
+    /**
+     * Display detailed check breakdown for a specific run.
+     */
+    public function report(string $runId)
+    {
+        $run = $this->repository->getRun($runId);
+        if (!$run) {
+            abort(404, 'System test run record not found.');
+        }
+
+        // Calculate Suite Statistics breakdown
+        $suiteStats = [];
+        $evidenceItems = [];
+        $evidenceCategories = [];
+
+        foreach ($run['checks'] ?? [] as $check) {
+            $suite = $check['suite'] ?? 'General';
+            if (!isset($suiteStats[$suite])) {
+                $suiteStats[$suite] = [
+                    'name' => $suite,
+                    'total' => 0,
+                    'passed' => 0,
+                    'failed' => 0,
+                    'warnings' => 0,
+                    'duration_ms' => 0,
+                ];
+            }
+            $suiteStats[$suite]['total']++;
+            $st = strtolower($check['status'] ?? 'passed');
+            if (isset($suiteStats[$suite][$st])) {
+                $suiteStats[$suite][$st]++;
+            } else {
+                $suiteStats[$suite]['passed']++;
+            }
+            $suiteStats[$suite]['duration_ms'] += ($check['duration_ms'] ?? 0);
+
+            if (!empty($check['evidence'])) {
+                $category = 'Core Browser';
+                if (preg_match('/\[([A-Z]+-\d+)\]/', $suite, $sm)) {
+                    $category = $sm[1];
+                } elseif (preg_match('/^([a-z]+)(\d+)\//i', $check['evidence'], $pm)) {
+                    $category = strtoupper($pm[1]) . '-' . $pm[2];
+                }
+                $evidenceCategories[$category] = ($evidenceCategories[$category] ?? 0) + 1;
+                $evidenceItems[] = [
+                    'name' => $check['name'] ?? 'Captured Evidence',
+                    'evidence' => $check['evidence'],
+                    'message' => $check['message'] ?? '',
+                    'status' => $check['status'] ?? 'passed',
+                    'category' => $category,
+                    'suite' => $suite,
+                ];
+            }
+        }
+
+        // Fallback: If no evidence on checks, inspect physical evidence directory
+        if (empty($evidenceItems)) {
+            $evidenceDir = storage_path("app/system-tests/runs/{$run['id']}/evidence");
+            if (is_dir($evidenceDir)) {
+                $allPngs = glob("{$evidenceDir}/*.png") ?: [];
+                foreach (glob("{$evidenceDir}/*/*.png") ?: [] as $subPng) {
+                    $allPngs[] = $subPng;
+                }
+                foreach ($allPngs as $path) {
+                    $rel = ltrim(str_replace($evidenceDir, '', $path), '/');
+                    $base = pathinfo($path, PATHINFO_FILENAME);
+                    $cleanName = ucwords(str_replace(['_', '-'], ' ', $base));
+                    $category = 'Core Browser';
+                    if (preg_match('/^([a-z]+)(\d+)\//i', $rel, $pm)) {
+                        $category = strtoupper($pm[1]) . '-' . $pm[2];
+                    }
+                    $evidenceCategories[$category] = ($evidenceCategories[$category] ?? 0) + 1;
+                    $evidenceItems[] = [
+                        'name' => "Captured Evidence: {$cleanName}",
+                        'evidence' => $rel,
+                        'message' => 'Visual screenshot captured on disk',
+                        'status' => 'passed',
+                        'category' => $category,
+                        'suite' => 'Browser Evidence',
+                    ];
+                }
+            }
+        }
+
+        return view('admin.system_tests.report', [
+            'layout' => $this->resolveDashboardLayout(),
+            'run' => $run,
+            'suiteStats' => $suiteStats,
+            'evidenceItems' => $evidenceItems,
+            'evidenceCategories' => $evidenceCategories,
+        ]);
+    }
+
+    /**
+     * Download run JSON manifest.
+     */
+    public function download(string $runId)
+    {
+        $safeRunId = basename($runId);
+        $file = storage_path("app/system-tests/runs/{$safeRunId}/run.json");
+        if (!file_exists($file)) {
+            abort(404, 'Run JSON file not found.');
+        }
+
+        return response()->download($file, "system-test-{$safeRunId}.json", [
+            'Content-Type' => 'application/json',
+        ]);
+    }
+
+    /**
+     * Delete an individual system test run.
+     */
+    public function destroyRun(string $runId): JsonResponse
+    {
+        $safeRunId = basename($runId);
+        $deleted = $this->repository->deleteRun($safeRunId);
+
+        if ($deleted) {
+            return response()->json([
+                'success' => true,
+                'message' => "Run {$safeRunId} was permanently deleted.",
+            ]);
+        }
+
+        return response()->json([
+            'success' => false,
+            'message' => "Run {$safeRunId} could not be deleted or does not exist.",
+        ], 404);
+    }
+
+    /**
+     * Serve evidence screenshot securely.
+     */
+    public function screenshot(string $runId, string $filename)
+    {
+        $safeRunId = basename($runId);
+        $normalized = str_replace(['..', '\\'], '', $filename);
+        $filePath = storage_path("app/system-tests/runs/{$safeRunId}/evidence/{$normalized}");
+
+        if (!file_exists($filePath) || !is_file($filePath)) {
+            abort(404, 'Evidence screenshot not found.');
+        }
+
+        return response()->file($filePath, [
+            'Content-Type' => 'image/png',
+            'Cache-Control' => 'no-cache, private',
+        ]);
+    }
+
+    /**
+     * Purge synthetic entities and old runs.
+     */
+    public function cleanup(Request $request): JsonResponse
+    {
+        $world = new SyntheticWorld();
+        $deleted = $world->teardown();
+
+        $cleanedRuns = $this->repository->cleanupOldRuns(1);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Synthetic test data cleaned safely.',
+            'deleted' => $deleted,
+            'cleaned_runs' => $cleanedRuns,
+        ]);
+    }
+
+    /**
+     * Resolve the host application's existing admin theme or fallback layout.
+     */
+    protected function resolveDashboardLayout(): string
+    {
+        $configLayout = config('system-test.dashboard.layout');
+        if ($configLayout && view()->exists($configLayout)) {
+            return $configLayout;
+        }
+
+        if (isset($this->adminTheme) && view()->exists($this->adminTheme)) {
+            return $this->adminTheme;
+        }
+
+        $candidates = [
+            'adminTheme.default',
+            'admin.layouts.app',
+            'admin.layouts.master',
+            'admin.layouts.admin',
+            'layouts.admin',
+            'layouts.app',
+            'admin.layout',
+            'layouts.backend',
+        ];
+
+        foreach ($candidates as $candidate) {
+            if (view()->exists($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return 'system-test::standalone';
+    }
+}
+
